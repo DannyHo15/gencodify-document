@@ -1320,30 +1320,424 @@ export const deploymentRouter = router({
         id: 'data-flows',
         title: '2.3 Data Flows',
         content: [
-          { type: 'header', value: 'tRPC & PostgREST Flow' },
-          { type: 'text', value: 'All complex data mutations go through tRPC procedures. Simple CRUD operations use PostgREST for direct database access.' },
-          { type: 'code', language: 'typescript', value: `// Data Query Flow via tRPC
+          { type: 'header', value: 'Overview' },
+          { type: 'text', value: 'GenCodify Studio implements multiple data flow patterns optimized for different use cases. The architecture separates complex mutations (tRPC) from simple queries (PostgREST/Remix loaders) while maintaining type safety and authorization throughout.' },
+          { type: 'mermaid', value: `graph TB
+    subgraph "Client Data Layer"
+      UI[React Components]
+      NanoStores[NanoStores State]
+      ReactSDK[React SDK]
+    end
+
+    subgraph "Communication Layer"
+      TRPC[tRPC Procedures]
+      RemixLoaders[Remix Loaders]
+      PostgREST[PostgREST Client]
+      CanvasBridge[Canvas postMessage Bridge]
+    end
+
+    subgraph "Server Data Layer"
+      RemixServer[Remix Server]
+      TRPCRouter[tRPC Router]
+      Procedures[Protected Procedures]
+      Prisma[Prisma ORM]
+      Postgres[(PostgreSQL)]
+    end
+
+    subgraph "External Services"
+      S3[S3/R2 Storage]
+      OAuth[OAuth Providers]
+      YjsSync[Yjs Sync Server]
+    end
+
+    UI --> NanoStores
+    UI --> TRPC
+    UI --> RemixLoaders
+    UI --> CanvasBridge
+    NanoStores --> ReactSDK
+    TRPC --> RemixServer
+    RemixLoaders --> RemixServer
+    PostgREST --> Postgres
+    RemixServer --> TRPCRouter
+    TRPCRouter --> Procedures
+    Procedures --> Prisma
+    Prisma --> Postgres
+    CanvasBridge --> CanvasFrame
+
+    style UI fill:#e1f5fe
+    style Postgres fill:#fff3e0
+    style S3 fill:#f3e5f5` },
+          { type: 'header', value: '1. Client-to-Server Data Flows' },
+          { type: 'text', value: 'The application uses three primary mechanisms for client-to-server communication, each optimized for specific use cases.' },
+          { type: 'header', value: 'tRPC Mutation Flow' },
+          { type: 'text', value: 'Used for complex business operations that require authorization checks, validation, and multi-step transactions. All mutations flow through protected procedures with RBAC enforcement.' },
+          { type: 'code', language: 'typescript', value: `// Client-side tRPC mutation
+import { trpc } from "~/shared/trpc/client";
+
+const publishProject = async (projectId: string) => {
+  const result = await trpc.projects.publish.mutate({
+    projectId,
+    destination: "saas",
+    builderOrigin: window.location.origin
+  });
+
+  if (result.success) {
+    toast.success("Published successfully!");
+  }
+};
+
+// Server-side protected procedure
 export const projectRouter = router({
-  get: protectedProcedure
-    .input(z.object({ id: z.string() }))
-    .query(async ({ ctx, input }) => {
+  publish: protectedProcedure
+    .input(z.object({
+      projectId: z.string(),
+      destination: z.enum(["saas", "static"]),
+      builderOrigin: z.string()
+    }))
+    .use(async ({ ctx, input, next }) => {
       // Authorization Check
-      await ctx.canViewProject(input.id);
-      
-      // Database Query via Prisma
-      return ctx.prisma.project.findUnique({
-        where: { id: input.id },
-        include: { pages: true }
+      const canPublish = await ctx.authorization.can(
+        { projectId: input.projectId },
+        "publish"
+      );
+
+      if (!canPublish) {
+        throw new Error("Unauthorized");
+      }
+
+      return next();
+    })
+    .mutation(async ({ ctx, input }) => {
+      // 1. Generate build
+      const build = await generateBuild(input.projectId);
+
+      // 2. Deploy to destination
+      const deployment = await deployBuild(build, input.destination);
+
+      // 3. Update project status
+      return ctx.prisma.project.update({
+        where: { id: input.projectId },
+        data: {
+          latestDeploymentId: deployment.id,
+          publishedAt: new Date()
+        }
       });
     })
+});` },
+          { type: 'header', value: 'Remix Loader/Action Flow' },
+          { type: 'text', value: 'Used for form submissions and page-level data fetching. Remix loaders provide SSR hydration and progressive enhancement.' },
+          { type: 'code', language: 'typescript', value: `// apps/builder/app/routes/_index.tsx
+import { json, type LoaderFunctionArgs } from "@remix-run/node";
+import { useLoaderData } from "@remix-run/react";
+
+export const loader = async (args: LoaderFunctionArgs) => {
+  const { request } = args;
+  const userId = await getUserId(request);
+
+  // Query projects via Prisma
+  const projects = await prisma.project.findMany({
+    where: {
+      userId,
+      deletedAt: null
+    },
+    orderBy: { updatedAt: "desc" },
+    take: 50
+  });
+
+  return json({ projects });
+};
+
+export default function ProjectsPage() {
+  const { projects } = useLoaderData<typeof loader>();
+
+  return (
+    <div>
+      {projects.map(project => (
+        <ProjectCard key={project.id} project={project} />
+      ))}
+    </div>
+  );
+}` },
+          { type: 'header', value: 'PostgREST Direct Query Flow' },
+          { type: 'text', value: 'Used for simple CRUD operations that don\'t require complex authorization. PostgREST provides direct SQL-to-HTTP mapping with built-in filters.' },
+          { type: 'code', language: 'typescript', value: `// packages/postgrest/src/client.ts
+import { createClient } from "@webstudio-is/postgrest";
+
+const postgrest = createClient({
+  baseUrl: process.env.POSTGREST_URL!,
+  headers: {
+    Authorization: \`Bearer \${token}\`
+  }
 });
 
-// Direct CRUD via PostgREST
-const project = await postgrest
+// Direct query with filters
+const projects = await postgrest
   .from('projects')
   .select('*')
-  .eq('id', projectId)
-  .single();` }
+  .eq('userId', userId)
+  .is('deletedAt', null)
+  .order('updatedAt', { ascending: false })
+  .range(0, 49);` },
+          { type: 'header', value: '2. Server-to-Client Data Flows' },
+          { type: 'text', value: 'Data flowing from server to client uses three primary patterns: SSR hydration via Remix loaders, real-time updates via polling/WebSocket, and optimistic updates.' },
+          { type: 'mermaid', value: `graph LR
+    Server[Server] -->|Remix Loader| HTML[HTML + JSON]
+    HTML -->|Hydration| React[React App]
+    Server -->|Real-time Updates| React
+    ClientActions[Client Actions] -->|Optimistic Update| React
+    ClientActions -->|Sync with Server| Server` },
+          { type: 'header', value: '3. Canvas-to-Builder Data Flow' },
+          { type: 'text', value: 'The canvas iframe communicates with the builder window via postMessage API. This is the critical data flow for the visual editing experience.' },
+          { type: 'code', language: 'typescript', value: `// apps/builder/app/canvas/use-canvas-bridge.ts
+const useCanvasBridge = (canvasRef: React.RefObject<HTMLIFrameElement>) => {
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const handleMessage = (event: MessageEvent) => {
+      // Validate origin
+      if (event.origin !== canvasOrigin) return;
+
+      const { type, payload } = event.data;
+
+      switch (type) {
+        case 'COMPONENT_SELECTED':
+          // User clicked component in canvas
+          setSelectedInstance(payload.instanceId);
+          break;
+
+        case 'STYLES_CHANGED':
+          // Styles updated in canvas
+          publishStyleChanges(payload);
+          break;
+
+        case 'ERROR_OCCURRED':
+          // Runtime error in canvas
+          showErrorToast(payload.error);
+          break;
+      }
+    };
+
+    window.addEventListener('message', handleMessage);
+    return () => window.removeEventListener('message', handleMessage);
+  }, [canvasRef]);
+
+  // Send commands to canvas
+  const sendToCanvas = (type: string, payload: unknown) => {
+    canvasRef.current?.contentWindow?.postMessage(
+      { type, payload },
+      canvasOrigin
+    );
+  };
+
+  return { sendToCanvas };
+};` },
+          { type: 'header', value: '4. Database Query Flows' },
+          { type: 'text', value: 'Database access uses three layers: Prisma ORM for complex queries, PostgREST for simple CRUD, and direct connection pooling for performance.' },
+          { type: 'mermaid', value: `graph TD
+    App[Application] -->|Complex Queries| Prisma[Prisma ORM]
+    App -->|Simple CRUD| PostgREST[PostgREST]
+    Prisma -->|Query Builder| Pool[Connection Pool]
+    PostgREST -->|Direct SQL| Pool
+    Pool -->|PgBouncer| Postgres[(PostgreSQL)]
+
+    Pool -->|Health Check| HealthCheck{OK?}
+    HealthCheck -->|No| Retry[Retry Logic]
+    Retry --> Pool` },
+          { type: 'header', value: 'Prisma Query Flow' },
+          { type: 'code', language: 'typescript', value: `// packages/database/src/prisma.ts
+import { PrismaClient } from "@prisma/client";
+
+const prisma = new PrismaClient({
+  log: process.env.NODE_ENV === "development"
+    ? ["query", "error", "warn"]
+    : ["error"]
+});
+
+// Optimized queries with includes
+const getProjectWithDependencies = async (projectId: string) => {
+  return prisma.project.findUnique({
+    where: { id: projectId },
+    include: {
+      pages: {
+        include: {
+          children: true
+        }
+      },
+      props: true,
+      styles: true,
+      assets: true,
+      breakpoints: true
+    }
+  });
+};` },
+          { type: 'header', value: '5. Asset Upload Flow' },
+          { type: 'text', value: 'Assets are uploaded to S3/R2 storage with optimization and metadata extraction. The flow supports direct browser uploads to avoid server bottlenecks.' },
+          { type: 'mermaid', value: `graph TD
+    Client[Client] -->|Request Upload| Server[Server]
+    Server -->|Generate Presigned URL| S3[S3/R2]
+    Server -->|Return URL| Client
+    Client -->|Direct Upload| S3
+    S3 -->|Confirm Upload| Server
+    Server -->|Create Asset Record| DB[(Database)]
+    Server -->|Return Asset| Client` },
+          { type: 'code', language: 'typescript', value: `// packages/asset-uploader/src/uploader.ts
+const uploadAsset = async (file: File) => {
+  // 1. Request upload authorization
+  const { uploadId, url, fields } = await trpc.assets.requestUpload.mutate({
+    filename: file.name,
+    contentType: file.type,
+    size: file.size
+  });
+
+  // 2. Upload directly to S3/R2
+  const formData = new FormData();
+  Object.entries(fields).forEach(([key, value]) => {
+    formData.append(key, value);
+  });
+  formData.append('file', file);
+
+  await fetch(url, {
+    method: 'POST',
+    body: formData
+  });
+
+  // 3. Confirm upload and get asset record
+  const asset = await trpc.assets.confirmUpload.mutate({
+    uploadId
+  });
+
+  return asset;
+};` },
+          { type: 'header', value: '6. Authentication Data Flow' },
+          { type: 'text', value: 'Authentication uses Remix Auth with OAuth strategies. The flow supports multiple providers with session management via cookies.' },
+          { type: 'mermaid', value: `graph TD
+    User[User] -->|Click Login| App[Builder App]
+    App -->|Redirect| Provider[OAuth Provider]
+    Provider -->|Authorization Code| App
+    App -->|Exchange Code| Provider
+    Provider -->|Access Token| App
+    App -->|Create Session| Session[Session Store]
+    App -->|Set Cookie| Browser[Browser]
+    Browser -->|Subsequent Requests| App
+    App -->|Validate Session| Session` },
+          { type: 'code', language: 'typescript', value: `// apps/builder/app/services/auth.server.ts
+import { authenticator } from "./authenticator";
+import { commitSession, getSession } from "./session";
+
+export const login = async (request: Request) => {
+  // Redirect to OAuth provider
+  return authenticator.authenticate("github", request);
+};
+
+export const callback = async (request: Request) => {
+  // Handle OAuth callback
+  const user = await authenticator.authenticate("github", request);
+
+  // Create session
+  const session = await getSession(request.headers.get("Cookie"));
+  session.set("userId", user.id);
+
+  // Set cookie and redirect
+  return redirect("/dashboard", {
+    headers: {
+      "Set-Cookie": await commitSession(session)
+    }
+  });
+};` },
+          { type: 'header', value: '7. Real-time Collaboration Flow' },
+          { type: 'text', value: 'Collaboration uses Yjs CRDT for conflict-free replicated data types. Multiple users can edit simultaneously without conflicts.' },
+          { type: 'mermaid', value: `graph TD
+    User1[User 1] -->|Edit| LocalDoc1[Local Yjs Doc]
+    User2[User 2] -->|Edit| LocalDoc2[Local Yjs Doc]
+    LocalDoc1 -->|Broadcast| SyncServer[Yjs Sync Server]
+    LocalDoc2 -->|Broadcast| SyncServer
+    SyncServer -->|Merge & Broadcast| LocalDoc1
+    SyncServer -->|Merge & Broadcast| LocalDoc2` },
+          { type: 'code', language: 'typescript', value: `// packages/collaboration/src/yjs-client.ts
+import * as Y from "yjs";
+import { WebsocketProvider } from "y-websocket";
+
+const ydoc = new Y.Doc();
+const provider = new WebsocketProvider(
+  "wss://sync.gencodify.dev",
+  "project-" + projectId,
+  ydoc
+);
+
+// Shared document type
+const doc = ydoc.getXmlFragment("doc");
+
+// Observe changes
+doc.observe((events) => {
+  events.forEach((event) => {
+    if (event.origin === provider.awareness) {
+      // Remote change
+      handleRemoteChange(event.changes);
+    }
+  });
+});
+
+// Local change
+const insertText = (text: string) => {
+  const textNode = new Y.Text(text);
+  doc.insert(textNode);
+};` },
+          { type: 'header', value: '8. Build & Deployment Flow' },
+          { type: 'text', value: 'The build and deployment flow generates static assets from the project data and deploys to the configured destination.' },
+          { type: 'mermaid', value: `graph TD
+    Trigger[Trigger Build] -->|Fetch Project| DB[(Database)]
+    DB -->|Project Data| Generator[Static Site Generator]
+    Generator -->|Render Pages| Renderer[React Renderer]
+    Renderer -->|Generate HTML| HTML[Static HTML]
+    Renderer -->|Generate CSS| CSS[Atomic CSS]
+    Renderer -->|Collect Assets| Assets[Asset Bundler]
+
+    HTML -->|Package| Build[Build Output]
+    CSS -->|Package| Build
+    Assets -->|Optimize| Build
+
+    Build -->|Upload| S3[(S3/R2)]
+    Build -->|Invalidate| CDN[CDN Cache]
+    Build -->|Notify| Webhook[Webhooks]` },
+          { type: 'code', language: 'typescript', value: `// packages/build/src/generate.ts
+export const generateBuild = async (projectId: string) => {
+  // 1. Fetch project data
+  const project = await prisma.project.findUnique({
+    where: { id: projectId },
+    include: {
+      pages: true,
+      props: true,
+      styles: true,
+      assets: true
+    }
+  });
+
+  // 2. Generate static pages
+  const pages = await Promise.all(
+    project.pages.map(async (page) => {
+      const html = await renderPage(page, project);
+      const css = await generateCSS(project.styles);
+      return { page, html, css };
+    })
+  );
+
+  // 3. Generate atomic CSS
+  const atomicCSS = generateAtomicCSS(project.styles);
+
+  // 4. Collect and optimize assets
+  const assets = await collectAssets(project.assets);
+
+  return {
+    pages,
+    atomicCSS,
+    assets,
+    meta: {
+      version: generateVersion(),
+      timestamp: Date.now()
+    }
+  };
+};` }
         ]
       }
     ]
